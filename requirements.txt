@@ -1,0 +1,24 @@
+# ==============================================================================
+# Classical Deepfake Detection — Dependencies
+# ==============================================================================
+# Core ML / Deep Learning
+torch>=2.0.0
+torchvision>=0.15.0
+
+# Scientific Computing
+numpy>=1.24.0
+pandas>=2.0.0
+scikit-learn>=1.3.0
+
+# Computer Vision
+opencv-python>=4.8.0
+Pillow>=10.0.0
+
+# Visualisation
+matplotlib>=3.7.0
+
+# Model Serialisation
+joblib>=1.3.0
+
+# Progress Bars
+tqdm>=4.65.0
