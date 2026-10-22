@@ -1,28 +1,33 @@
 """
 Evaluation Script — Classical Deepfake Detector
 =================================================
-Loads saved models (scaler, PCA, SVM) and evaluates on the held-out
-test set at BOTH frame level and video level.
+Loads saved models (scaler, PCA, and specified classical classifier(s)) and evaluates
+on the held-out test set at BOTH frame level and video level.
 
 Usage:
-    python src/evaluate.py
+    python src/evaluate.py --model svm
+    python src/evaluate.py --model logistic_regression
+    python src/evaluate.py --model random_forest
+    python src/evaluate.py --model xgboost
+    python src/evaluate.py --model mlp
+    python src/evaluate.py --model all
 
 Inputs:
     models/scaler.pkl
     models/pca.pkl
-    models/svm.pkl
+    models/<model_name>.pkl
     features/test_features.npy
     features/test_labels.npy
     features/test_video_ids.npy
 
 Outputs:
-    results/confusion_matrix_frame.png
-    results/roc_curve_frame.png
-    results/confusion_matrix_video.png
-    results/roc_curve_video.png
-    results/metrics.json
-    results/classification_report.txt
-    results/experiment_config.json
+    results/<model_name>/confusion_matrix_frame.png
+    results/<model_name>/roc_curve_frame.png
+    results/<model_name>/confusion_matrix_video.png
+    results/<model_name>/roc_curve_video.png
+    results/<model_name>/metrics.json
+    results/<model_name>/classification_report.txt
+    results/<model_name>/experiment_config.json
 """
 
 import sys
@@ -49,6 +54,7 @@ from sklearn.metrics import (
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from config import Config
+from models import load_model, AVAILABLE_MODELS
 from utils import setup_logger, ensure_dir, set_seed, format_count
 
 logger = setup_logger("evaluate")
@@ -111,22 +117,7 @@ def aggregate_video_predictions(
     probabilities: np.ndarray,
     threshold: float = 0.5,
 ) -> tuple:
-    """Aggregate frame-level predictions to video level.
-
-    For each video:
-    1. Collect all frame fake-probabilities.
-    2. Compute the mean probability.
-    3. Classify as FAKE if mean probability >= threshold.
-
-    Args:
-        video_ids: Array of video IDs per frame.
-        labels: Ground truth labels per frame.
-        probabilities: Predicted fake probability per frame.
-        threshold: Decision threshold.
-
-    Returns:
-        (video_labels, video_probs, video_preds, unique_video_ids)
-    """
+    """Aggregate frame-level predictions to video level."""
     unique_ids = np.unique(video_ids)
     video_labels = []
     video_probs = []
@@ -137,7 +128,6 @@ def aggregate_video_predictions(
         vid_labels = labels[mask]
         vid_probs = probabilities[mask]
 
-        # All frames in a video should have the same label
         video_label = int(vid_labels[0])
         mean_prob = float(np.mean(vid_probs))
         video_pred = 1 if mean_prob >= threshold else 0
@@ -155,16 +145,7 @@ def aggregate_video_predictions(
 
 
 def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray, y_prob: np.ndarray) -> dict:
-    """Compute all evaluation metrics.
-
-    Args:
-        y_true: Ground truth labels.
-        y_pred: Predicted labels.
-        y_prob: Predicted fake probabilities.
-
-    Returns:
-        Dictionary of metric name → value.
-    """
+    """Compute all evaluation metrics."""
     metrics = {
         "accuracy": float(accuracy_score(y_true, y_pred)),
         "precision": float(precision_score(y_true, y_pred, zero_division=0)),
@@ -172,7 +153,6 @@ def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray, y_prob: np.ndarray) 
         "f1_score": float(f1_score(y_true, y_pred, zero_division=0)),
     }
 
-    # ROC-AUC requires both classes present
     if len(np.unique(y_true)) > 1:
         metrics["roc_auc"] = float(roc_auc_score(y_true, y_prob))
     else:
@@ -182,9 +162,180 @@ def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray, y_prob: np.ndarray) 
     return metrics
 
 
+def evaluate_classifier(
+    model_name: str,
+    model_obj,
+    X_test_pca: np.ndarray,
+    y_test: np.ndarray,
+    video_ids: np.ndarray,
+    pca_n_components: int,
+    X_test_orig_dim: int,
+    results_base_dir: Path,
+    cfg: Config,
+    threshold: float = 0.5,
+) -> dict:
+    """Run full frame-level and video-level evaluation for a single model."""
+    display_name = getattr(model_obj, "display_name", model_name.upper())
+
+    # Frame-level inference
+    if hasattr(model_obj, "predict_proba"):
+        y_prob = model_obj.predict_proba(X_test_pca)[:, 1]
+    else:
+        y_prob = model_obj.predict(X_test_pca)
+
+    y_pred = model_obj.predict(X_test_pca)
+
+    frame_metrics = compute_metrics(y_test, y_pred, y_prob)
+
+    print()
+    print("─" * 60)
+    print(f"  FRAME-LEVEL Results — [{display_name}]")
+    print("─" * 60)
+    for metric_name, value in frame_metrics.items():
+        val_str = f"{value:.4f}" if value is not None else "N/A"
+        print(f"  {metric_name:12s}: {val_str}")
+    print()
+
+    frame_report = classification_report(
+        y_test, y_pred,
+        target_names=["REAL", "FAKE"],
+        digits=4,
+    )
+    print(frame_report)
+
+    # Video-level inference
+    vid_labels, vid_probs, vid_preds, unique_vids = aggregate_video_predictions(
+        video_ids, y_test, y_prob, threshold=threshold,
+    )
+
+    video_metrics = compute_metrics(vid_labels, vid_preds, vid_probs)
+
+    print("─" * 60)
+    print(f"  VIDEO-LEVEL Results — [{display_name}]")
+    print("─" * 60)
+    print(f"  Total test videos: {format_count(len(unique_vids))}")
+    print(f"  Threshold:         {threshold}")
+    print()
+    for metric_name, value in video_metrics.items():
+        val_str = f"{value:.4f}" if value is not None else "N/A"
+        print(f"  {metric_name:12s}: {val_str}")
+    print()
+
+    video_report = classification_report(
+        vid_labels, vid_preds,
+        target_names=["REAL", "FAKE"],
+        digits=4,
+    )
+    print(video_report)
+
+    # Generate plots and save to results/<model_name>/
+    model_results_dir = ensure_dir(results_base_dir / model_name)
+
+    plot_confusion_matrix(
+        y_test, y_pred,
+        save_path=str(model_results_dir / "confusion_matrix_frame.png"),
+        title=f"Frame-Level Confusion Matrix ({display_name})",
+    )
+
+    if frame_metrics["roc_auc"] is not None:
+        plot_roc_curve(
+            y_test, y_prob,
+            save_path=str(model_results_dir / "roc_curve_frame.png"),
+            title=f"Frame-Level ROC Curve ({display_name})",
+        )
+
+    plot_confusion_matrix(
+        vid_labels, vid_preds,
+        save_path=str(model_results_dir / "confusion_matrix_video.png"),
+        title=f"Video-Level Confusion Matrix ({display_name})",
+    )
+
+    if video_metrics["roc_auc"] is not None:
+        plot_roc_curve(
+            vid_labels, vid_probs,
+            save_path=str(model_results_dir / "roc_curve_video.png"),
+            title=f"Video-Level ROC Curve ({display_name})",
+        )
+
+    # Top-level results copies for default/backward compatibility
+    if model_name in ["svm", AVAILABLE_MODELS[0]]:
+        top_dir = ensure_dir(results_base_dir)
+        plot_confusion_matrix(y_test, y_pred, save_path=str(top_dir / "confusion_matrix_frame.png"))
+        plot_confusion_matrix(vid_labels, vid_preds, save_path=str(top_dir / "confusion_matrix_video.png"))
+        if frame_metrics["roc_auc"] is not None:
+            plot_roc_curve(y_test, y_prob, save_path=str(top_dir / "roc_curve_frame.png"))
+        if video_metrics["roc_auc"] is not None:
+            plot_roc_curve(vid_labels, vid_probs, save_path=str(top_dir / "roc_curve_video.png"))
+
+    all_metrics = {
+        "model_name": model_name,
+        "display_name": display_name,
+        "dataset": "FaceForensics++ (C23)",
+        "test_samples_frame": int(len(y_test)),
+        "test_samples_video": int(len(unique_vids)),
+        "pca_components": int(pca_n_components),
+        "video_threshold": threshold,
+        "frame_level": frame_metrics,
+        "video_level": video_metrics,
+    }
+
+    metrics_path = model_results_dir / "metrics.json"
+    with open(metrics_path, "w") as f:
+        json.dump(all_metrics, f, indent=4)
+    logger.info(f"Saved metrics: {metrics_path}")
+
+    # Top-level metrics.json backward compatibility copy
+    if model_name == "svm":
+        with open(results_base_dir / "metrics.json", "w") as f:
+            json.dump(all_metrics, f, indent=4)
+
+    report_path = model_results_dir / "classification_report.txt"
+    with open(report_path, "w") as f:
+        f.write(f"FRAME-LEVEL CLASSIFICATION REPORT — [{display_name}]\n")
+        f.write("=" * 60 + "\n")
+        f.write(frame_report + "\n\n")
+        f.write(f"VIDEO-LEVEL CLASSIFICATION REPORT — [{display_name}]\n")
+        f.write("=" * 60 + "\n")
+        f.write(video_report + "\n")
+    logger.info(f"Saved classification report: {report_path}")
+
+    # Top-level classification report copy
+    if model_name == "svm":
+        with open(results_base_dir / "classification_report.txt", "w") as f:
+            f.write(f"FRAME-LEVEL CLASSIFICATION REPORT — [{display_name}]\n")
+            f.write("=" * 60 + "\n")
+            f.write(frame_report + "\n\n")
+            f.write(f"VIDEO-LEVEL CLASSIFICATION REPORT — [{display_name}]\n")
+            f.write("=" * 60 + "\n")
+            f.write(video_report + "\n")
+
+    experiment_config = {
+        "project": "Classical Deepfake Detection",
+        "dataset": "FaceForensics++ C23",
+        "model_name": model_name,
+        "display_name": display_name,
+        "feature_extractor": "ResNet-18 (ImageNet pretrained)",
+        "feature_dim_original": int(X_test_orig_dim),
+        "feature_dim_pca": int(pca_n_components),
+        "class_weight": "balanced",
+        "random_seed": cfg.random_seed,
+        "label_encoding": {"REAL": 0, "FAKE": 1},
+    }
+    exp_config_path = model_results_dir / "experiment_config.json"
+    with open(exp_config_path, "w") as f:
+        json.dump(experiment_config, f, indent=4)
+    logger.info(f"Saved config: {exp_config_path}")
+
+    return all_metrics
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Evaluate the classical deepfake detector on the test set."
+        description="Evaluate classical deepfake detection classifiers."
+    )
+    parser.add_argument(
+        "--model", "-m", type=str, default="svm",
+        help=f"Classifier to evaluate: {AVAILABLE_MODELS + ['all']} (default: svm)."
     )
     parser.add_argument(
         "--threshold", type=float, default=0.5,
@@ -201,22 +352,24 @@ def main():
     print("=" * 60)
     print()
 
-    # ── Load models ───────────────────────────────────────────────────────────
+    # Load scaler & PCA
     models_dir = cfg.models_dir
-    for name in ["scaler.pkl", "pca.pkl", "svm.pkl"]:
-        if not (models_dir / name).exists():
+    scaler_path = models_dir / "scaler.pkl"
+    pca_path = models_dir / "pca.pkl"
+
+    for p in [scaler_path, pca_path]:
+        if not p.exists():
             logger.error(
-                f"Model file not found: {models_dir / name}\n"
+                f"Model file not found: {p}\n"
                 "Run 'python src/train.py' first."
             )
             sys.exit(1)
 
-    scaler = joblib.load(models_dir / "scaler.pkl")
-    pca = joblib.load(models_dir / "pca.pkl")
-    svm = joblib.load(models_dir / "svm.pkl")
-    logger.info("Loaded scaler, PCA, and SVM models.")
+    scaler = joblib.load(scaler_path)
+    pca = joblib.load(pca_path)
+    logger.info("Loaded scaler and PCA artefacts.")
 
-    # ── Load test features ────────────────────────────────────────────────────
+    # Load test features
     features_dir = cfg.features_dir
     for name in ["test_features.npy", "test_labels.npy", "test_video_ids.npy"]:
         if not (features_dir / name).exists():
@@ -234,166 +387,54 @@ def main():
         f"Test set: {format_count(X_test.shape[0])} samples × {X_test.shape[1]} dims"
     )
 
-    # ── Apply scaler + PCA ────────────────────────────────────────────────────
     X_test_scaled = scaler.transform(X_test)
     X_test_pca = pca.transform(X_test_scaled)
 
-    # ── Frame-level predictions ───────────────────────────────────────────────
-    y_pred = svm.predict(X_test_pca)
-    y_prob = svm.predict_proba(X_test_pca)[:, 1]  # P(FAKE)
+    # Determine models to evaluate
+    if args.model.lower() == "all":
+        models_to_eval = []
+        for m_name in AVAILABLE_MODELS:
+            p = models_dir / f"{m_name}.pkl"
+            if p.exists() or (m_name == "svm" and (models_dir / "svm.pkl").exists()):
+                models_to_eval.append(m_name)
+        if not models_to_eval:
+            logger.error(f"No trained models found in {models_dir}.")
+            sys.exit(1)
+    else:
+        models_to_eval = [args.model.lower()]
 
-    frame_metrics = compute_metrics(y_test, y_pred, y_prob)
-
-    print()
-    print("─" * 60)
-    print("  FRAME-LEVEL Results")
-    print("─" * 60)
-    for metric_name, value in frame_metrics.items():
-        if value is not None:
-            print(f"  {metric_name:12s}: {value:.4f}")
-        else:
-            print(f"  {metric_name:12s}: N/A")
-    print()
-
-    frame_report = classification_report(
-        y_test, y_pred,
-        target_names=["REAL", "FAKE"],
-        digits=4,
-    )
-    print(frame_report)
-
-    # ── Video-level predictions ───────────────────────────────────────────────
-    vid_labels, vid_probs, vid_preds, unique_vids = aggregate_video_predictions(
-        video_ids, y_test, y_prob, threshold=args.threshold,
-    )
-
-    video_metrics = compute_metrics(vid_labels, vid_preds, vid_probs)
-
-    print("─" * 60)
-    print("  VIDEO-LEVEL Results")
-    print("─" * 60)
-    print(f"  Total test videos: {format_count(len(unique_vids))}")
-    print(f"  Threshold:         {args.threshold}")
-    print()
-    for metric_name, value in video_metrics.items():
-        if value is not None:
-            print(f"  {metric_name:12s}: {value:.4f}")
-        else:
-            print(f"  {metric_name:12s}: N/A")
-    print()
-
-    video_report = classification_report(
-        vid_labels, vid_preds,
-        target_names=["REAL", "FAKE"],
-        digits=4,
-    )
-    print(video_report)
-
-    # ── Generate plots ────────────────────────────────────────────────────────
     results_dir = ensure_dir(cfg.results_dir)
 
-    # Frame-level plots
-    plot_confusion_matrix(
-        y_test, y_pred,
-        save_path=str(results_dir / "confusion_matrix_frame.png"),
-        title="Frame-Level Confusion Matrix",
-    )
+    for model_name in models_to_eval:
+        model_path = models_dir / f"{model_name}.pkl"
+        if not model_path.exists() and model_name == "svm":
+            model_path = models_dir / "svm.pkl"
 
-    frame_auc = None
-    if frame_metrics["roc_auc"] is not None:
-        frame_auc = plot_roc_curve(
-            y_test, y_prob,
-            save_path=str(results_dir / "roc_curve_frame.png"),
-            title="Frame-Level ROC Curve",
+        if not model_path.exists():
+            logger.error(f"Model file not found for '{model_name}': {model_path}")
+            continue
+
+        logger.info(f"Loading model object for '{model_name}' from {model_path}...")
+        model_obj = load_model(model_path)
+
+        evaluate_classifier(
+            model_name=model_name,
+            model_obj=model_obj,
+            X_test_pca=X_test_pca,
+            y_test=y_test,
+            video_ids=video_ids,
+            pca_n_components=pca.n_components_,
+            X_test_orig_dim=X_test.shape[1],
+            results_base_dir=results_dir,
+            cfg=cfg,
+            threshold=args.threshold,
         )
 
-    # Video-level plots
-    plot_confusion_matrix(
-        vid_labels, vid_preds,
-        save_path=str(results_dir / "confusion_matrix_video.png"),
-        title="Video-Level Confusion Matrix",
-    )
-
-    video_auc = None
-    if video_metrics["roc_auc"] is not None:
-        video_auc = plot_roc_curve(
-            vid_labels, vid_probs,
-            save_path=str(results_dir / "roc_curve_video.png"),
-            title="Video-Level ROC Curve",
-        )
-
-    # Safely extract SVM parameters regardless of CalibratedClassifierCV wrapper
-    base_est = getattr(svm, "estimator", getattr(svm, "base_estimator", svm))
-    svm_kernel = str(getattr(svm, "kernel", getattr(base_est, "kernel", "rbf")))
-    svm_c = float(getattr(svm, "C", getattr(base_est, "C", 10.0)))
-    svm_gamma = str(getattr(svm, "gamma", getattr(base_est, "gamma", "scale")))
-
-    # ── Save metrics ──────────────────────────────────────────────────────────
-    all_metrics = {
-        "dataset": "FaceForensics++ (C23)",
-        "test_samples_frame": int(len(y_test)),
-        "test_samples_video": int(len(unique_vids)),
-        "pca_components": int(pca.n_components_),
-        "svm_kernel": svm_kernel,
-        "svm_c": svm_c,
-        "svm_gamma": svm_gamma,
-        "video_threshold": args.threshold,
-        "frame_level": frame_metrics,
-        "video_level": video_metrics,
-    }
-
-    metrics_path = results_dir / "metrics.json"
-    with open(metrics_path, "w") as f:
-        json.dump(all_metrics, f, indent=4)
-    logger.info(f"Saved: {metrics_path}")
-
-    # Save classification reports
-    report_path = results_dir / "classification_report.txt"
-    with open(report_path, "w") as f:
-        f.write("FRAME-LEVEL CLASSIFICATION REPORT\n")
-        f.write("=" * 60 + "\n")
-        f.write(frame_report + "\n\n")
-        f.write("VIDEO-LEVEL CLASSIFICATION REPORT\n")
-        f.write("=" * 60 + "\n")
-        f.write(video_report + "\n")
-    logger.info(f"Saved: {report_path}")
-
-    # Save experiment config
-    experiment_config = {
-        "project": "Classical Deepfake Detection (Baseline)",
-        "dataset": "FaceForensics++ C23",
-        "feature_extractor": "ResNet-18 (ImageNet pretrained)",
-        "feature_dim_original": int(X_test.shape[1]),
-        "feature_dim_pca": int(pca.n_components_),
-        "pca_cumulative_variance": float(np.sum(pca.explained_variance_ratio_)),
-        "classifier": "RBF-SVM",
-        "svm_kernel": svm_kernel,
-        "svm_c": svm_c,
-        "svm_gamma": svm_gamma,
-        "class_weight": "balanced",
-        "random_seed": cfg.random_seed,
-        "label_encoding": {"REAL": 0, "FAKE": 1},
-    }
-    exp_config_path = results_dir / "experiment_config.json"
-    with open(exp_config_path, "w") as f:
-        json.dump(experiment_config, f, indent=4)
-    logger.info(f"Saved: {exp_config_path}")
-
-    # ── Final summary ─────────────────────────────────────────────────────────
     print()
     print("=" * 60)
     print("  Evaluation Complete")
     print("=" * 60)
     print(f"  Results saved to: {results_dir}")
-    print()
-    print("  Generated files:")
-    print(f"    • {results_dir / 'confusion_matrix_frame.png'}")
-    print(f"    • {results_dir / 'roc_curve_frame.png'}")
-    print(f"    • {results_dir / 'confusion_matrix_video.png'}")
-    print(f"    • {results_dir / 'roc_curve_video.png'}")
-    print(f"    • {results_dir / 'metrics.json'}")
-    print(f"    • {results_dir / 'classification_report.txt'}")
-    print(f"    • {results_dir / 'experiment_config.json'}")
     print()
 
 
