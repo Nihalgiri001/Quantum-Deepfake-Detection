@@ -719,3 +719,296 @@ This project uses FaceForensics++. If you use this work, please cite:
     year={2019}
 }
 ```
+
+---
+
+## 16. Quantum Kernel SVM (TrustLens-Q)
+
+This module extends the classical baseline with a Quantum Kernel Support Vector
+Machine.  The quantum classifier reuses every stage of the classical pipeline
+(face detection, ResNet-18 feature extraction, dataset splits) and replaces
+only the final classification step with a quantum kernel computed on a local
+simulator or real IBM QPU hardware.
+
+---
+
+### 16.1 Architecture
+
+```mermaid
+flowchart LR
+    V[Video] --> FD[Face Detection\nYuNet DNN]
+    FD --> FE[ResNet-18\n512-dim features]
+    FE --> QS[Quantum Scaler\nStandardScaler]
+    QS --> QP[Quantum PCA\n512 → 4/6/8 dims]
+    QP --> FS[Feature Scaling\nMinMaxScaler → ±π]
+    FS --> QFM[ZZFeatureMap\nn qubits]
+    QFM --> QK[FidelityQuantumKernel\nK = |⟨φ(x)|φ(x′)⟩|²]
+    QK --> SVC[SVC precomputed\nQuantum Kernel SVM]
+    SVC --> FL[Frame predictions]
+    FL --> VL[Video aggregation\nmean P(FAKE)]
+    VL --> R{REAL / FAKE}
+
+    style QFM fill:#6366f1,color:#fff
+    style QK fill:#6366f1,color:#fff
+    style SVC fill:#6366f1,color:#fff
+```
+
+---
+
+### 16.2 Why ZZFeatureMap?
+
+The ZZFeatureMap encodes an n-dimensional feature vector **x** into an
+n-qubit quantum state by applying a layer of Hadamard gates followed by
+single-qubit Z-rotations and pairwise ZZ-interaction gates.  The encoding
+repeats `reps` times.  Each pair of data points therefore occupies a
+superposition state in an exponentially large Hilbert space, allowing the
+kernel to capture high-order correlations that would require polynomial
+feature engineering classically.  Qiskit 2.x exposes this via the
+`zz_feature_map()` function (the `ZZFeatureMap` class is deprecated since
+2.1 and avoided throughout this codebase).
+
+---
+
+### 16.3 Why a Fidelity Quantum Kernel?
+
+The fidelity quantum kernel between two points **x** and **x′** is defined as:
+
+```
+K(x, x′) = |⟨φ(x)|φ(x′)⟩|²
+```
+
+where `|φ(x)⟩` is the quantum state produced by the ZZFeatureMap applied to
+**x**.  This is computed by the `ComputeUncompute` primitive: the feature map
+circuit for **x** is executed, then the inverse circuit for **x′** is appended,
+and the probability of measuring the all-zero state is returned.  The result is
+a symmetric positive semi-definite kernel matrix that is passed directly to
+`SVC(kernel="precomputed")`.
+
+---
+
+### 16.4 Why a Separate Quantum PCA?
+
+The classical pipeline uses a 512 → 64 PCA fitted on training data.
+A quantum circuit with 64 qubits is impractical on current hardware and slow
+even on a simulator.  The quantum module fits its **own** separate
+StandardScaler + PCA + MinMaxScaler pipeline that reduces 512 → 4/6/8
+dimensions and scales values to the range `[-π, π]` (appropriate for
+angle-encoding circuits).  This preprocessing is fitted on training data only
+and is completely independent of the classical PCA.
+
+---
+
+### 16.5 Quick-start (local simulator)
+
+Run these commands in order inside the activated virtual environment:
+
+```bash
+cd deepfake_classical
+source .venv/bin/activate
+```
+
+**Step 1 — Verify Qiskit installation**
+
+```bash
+python -m src.quantum.check_install
+```
+
+Expected: version table with ✅ for all four packages plus a 2-qubit kernel
+smoke test.
+
+**Step 2 — Fit quantum feature reducer**
+
+Requires `features/train_features.npy` to exist (run the classical pipeline
+through Step 4 first).
+
+```bash
+python -m src.quantum.feature_reducer --fit
+```
+
+Saves `models/quantum/scaler.pkl`, `pca.pkl`, `feature_scaler.pkl`,
+`feature_scaling.json`.
+
+**Step 3 — Smoke test (synthetic data, no dataset needed)**
+
+```bash
+python -m src.quantum.quantum_svm --smoke-test
+```
+
+Runs the full pipeline on 30 synthetic 512-dim samples.  Should complete in
+under 5 seconds.
+
+**Step 4 — Train on real FaceForensics++ features**
+
+```bash
+python -m src.quantum.quantum_svm --train --backend simulator
+```
+
+Options:
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--num-qubits` | `4` | Feature dimension (4, 6, or 8) |
+| `--reps` | `1` | ZZFeatureMap circuit repetitions |
+| `--max-samples` | `500` | Training samples (kernel is O(n²)) |
+| `--shots` | `1024` | Shots per circuit |
+
+**Step 5 — Evaluate**
+
+```bash
+python -m src.quantum.quantum_evaluate --backend simulator
+```
+
+Saves results to `results/quantum/` including a classical-vs-quantum CSV.
+
+**Step 6 — Predict on a single video**
+
+```bash
+python -m src.quantum.quantum_predict \
+    --input /path/to/video.mp4 \
+    --backend simulator
+```
+
+**Step 7 — Add to benchmark comparison**
+
+```bash
+python src/benchmark.py --include-quantum
+```
+
+---
+
+### 16.6 IBM Quantum Hardware Setup
+
+> **Usage note:** Free-tier IBM Quantum accounts receive approximately
+> **10 minutes of QPU time per month**.  Always run preflight first.
+
+**Set your API token** (never commit this to git):
+
+```bash
+export IBM_QUANTUM_TOKEN="your-ibm-quantum-api-token"
+```
+
+Get your token at https://quantum.ibm.com → Account settings → API token.
+
+**Inspect circuits and estimate cost without submitting anything:**
+
+```bash
+python -m src.quantum.ibm_hardware --preflight
+```
+
+The preflight report shows circuit depth, number of circuits, and estimated
+QPU seconds.  No job is submitted.
+
+**Submit a small hardware experiment** (only after reviewing the preflight):
+
+```bash
+python -m src.quantum.ibm_hardware --run --confirm
+```
+
+The `--confirm` flag is a mandatory safety gate — the command refuses to
+submit without it.
+
+**Use a specific backend:**
+
+```bash
+python -m src.quantum.ibm_hardware --preflight --backend-name ibm_brisbane
+```
+
+> The hardware QSVM experiment is kept completely separate from the
+> simulator-trained model.  Results are saved to
+> `models/quantum/hardware/` and `features/quantum/hardware/`.
+> Never mix simulator and hardware kernel matrices.
+
+---
+
+### 16.7 Model Artefact Locations
+
+| Artefact | Path | Description |
+|----------|------|-------------|
+| Quantum scaler | `models/quantum/scaler.pkl` | StandardScaler fitted on train |
+| Quantum PCA | `models/quantum/pca.pkl` | PCA 512 → n dims |
+| Feature scaler | `models/quantum/feature_scaler.pkl` | MinMaxScaler → [−π, π] |
+| Feature metadata | `models/quantum/feature_scaling.json` | Fit stats |
+| QSVM classifier | `models/quantum/quantum_svm.pkl` | Trained SVC |
+| Quantum config | `models/quantum/quantum_config.json` | QuantumConfig snapshot |
+| Training record | `models/quantum/training_metadata.json` | Run details |
+| Train features | `models/quantum/train_features_reduced.npy` | Reduced train set |
+| Training kernel | `features/quantum/K_train.npy` | (n × n) cached |
+| Val kernel | `features/quantum/K_val.npy` | (m × n) cached |
+| Test kernel | `features/quantum/K_test.npy` | (p × n) cached |
+| Hardware QSVM | `models/quantum/hardware/quantum_svm_hw.pkl` | Separate QPU model |
+| Hardware kernels | `features/quantum/hardware/K_*_hw.npy` | QPU-derived matrices |
+| Frame metrics | `results/quantum/metrics.json` | Frame + video metrics |
+| Comparison CSV | `results/quantum/classical_vs_quantum.csv` | Side-by-side table |
+
+---
+
+### 16.8 Classical vs Quantum Comparison
+
+After training both models, the comparison CSV at
+`results/quantum/classical_vs_quantum.csv` contains one row per model with
+these columns:
+
+| Column | Description |
+|--------|-------------|
+| `model` | Display name |
+| `frame_accuracy` | Frame-level accuracy |
+| `frame_f1` | Frame-level F1 score |
+| `frame_roc_auc` | Frame-level ROC-AUC |
+| `video_accuracy` | Video-level accuracy |
+| `video_f1` | Video-level F1 score |
+| `video_roc_auc` | Video-level ROC-AUC |
+
+The full benchmark comparison (all classical models + QSVM) is also in
+`results/comparison/model_comparison.csv` after running:
+
+```bash
+python src/benchmark.py --models all --include-quantum
+```
+
+> **Important:** A higher QSVM accuracy on one experiment does **not**
+> constitute quantum advantage.  Rigorous comparison requires equal data
+> splits, feature representations, and statistical testing.
+
+---
+
+### 16.9 Hardware Limitations
+
+- Free-tier IBM Quantum: ~10 minutes QPU time per month.
+- Start with the minimum sample size: `--n-train 6 --n-test 3`.
+- Use `--preflight` to estimate cost before every hardware run.
+- Hardware experiments use 4-qubit shallow circuits (depth ≈ 11) to stay
+  within the QPU budget.
+- Never train on a simulator kernel and evaluate using a hardware kernel
+  as if they were equivalent — the module enforces this separation.
+
+---
+
+### 16.10 Troubleshooting
+
+| Problem | Solution |
+|---------|----------|
+| `ImportError: cannot import name 'zz_feature_map'` | Install `qiskit==2.6.2`: `pip install 'qiskit==2.6.2'` |
+| `ImportError: FidelityQuantumKernel` | Install: `pip install 'qiskit-machine-learning==0.9.1'` |
+| Qiskit version conflict | Run `pip install -r requirements.txt` to pin all versions |
+| `IBM_QUANTUM_TOKEN not set` | `export IBM_QUANTUM_TOKEN="your-token"` |
+| `IBMAccountError` on connect | Token expired — regenerate at https://quantum.ibm.com |
+| `PreflightRequiredError` | Run `--preflight` before `--run --confirm` |
+| Kernel NaN/Inf error | Reduce `--num-qubits` or `--reps`; check feature values are in [−π, π] |
+| Slow kernel computation | Reduce `--max-samples`; kernel computation is O(n²) |
+| MPS errors on Apple Silicon | The quantum stack uses CPU only — no MPS is needed or used |
+| `RuntimeError: must be fitted` | Call `quantum_svm --train` before `quantum_evaluate` or `quantum_predict` |
+| `quantum_svm.pkl not found` | Run `python -m src.quantum.quantum_svm --train` first |
+
+---
+
+### 16.11 Running the Full Quantum Pipeline Test
+
+```bash
+# Verify everything works on synthetic data (no dataset required)
+python src/smoke_test.py --quantum
+
+# Run the 118-test automated suite
+pytest src/quantum/tests/ -v
+```
+
+Both should complete in under 10 seconds and report no failures.

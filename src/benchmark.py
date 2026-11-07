@@ -132,6 +132,14 @@ def main():
         "--threshold", type=float, default=0.5,
         help="Video classification threshold (default: 0.5)."
     )
+    parser.add_argument(
+        "--include-quantum", action="store_true",
+        help=(
+            "Append Quantum Kernel SVM to the comparison table. "
+            "Requires a trained QSVM in models/quantum/ and cached "
+            "kernel matrices in features/quantum/. Does NOT recompute kernels."
+        ),
+    )
     args = parser.parse_args()
 
     cfg = Config()
@@ -252,6 +260,110 @@ def main():
         }
         benchmark_records.append(record)
 
+    # ── QUANTUM extension (additive — only runs with --include-quantum) ─────────
+    if args.include_quantum:
+        print()
+        print("=" * 70)
+        print("  QUANTUM KERNEL SVM — Loading pre-trained model")
+        print("=" * 70)
+        print("  NOTE: QSVM timing includes kernel computation time.")
+        print("        Kernel matrices are loaded from cache (not recomputed).")
+        print()
+
+        q_record = None
+        try:
+            sys.path.insert(0, str(Path(__file__).resolve().parent))
+            from quantum.quantum_svm import QuantumSVM
+            from quantum.feature_reducer import QuantumFeatureReducer
+            from quantum.quantum_config import QuantumConfig
+            from quantum.kernel_utils import load_kernel_matrix
+
+            q_models_dir  = cfg.models_dir / "quantum"
+            q_kernel_dir  = cfg.features_dir / "quantum"
+
+            # Load QSVM
+            qsvm    = QuantumSVM.load(str(q_models_dir))
+            reducer = QuantumFeatureReducer.load(str(q_models_dir))
+            q_cfg   = qsvm.config
+            logger.info(f"Loaded QuantumSVM ({q_cfg.num_qubits} qubits)")
+
+            # Load cached test kernel matrix
+            k_test_path = q_kernel_dir / "K_test.npy"
+            if not k_test_path.exists():
+                raise FileNotFoundError(
+                    f"Cached K_test not found: {k_test_path}\n"
+                    "Run 'python -m src.quantum.quantum_svm --train' first."
+                )
+            K_test_hw, k_meta = load_kernel_matrix(str(k_test_path))
+            k_compute_time = float((k_meta or {}).get("compute_time_sec", 0.0))
+
+            # Load test labels and video IDs (from quantum subsampled cache)
+            q_y_test   = np.load(str(q_kernel_dir / "test_labels.npy"))
+            q_vid_test = np.load(str(q_kernel_dir / "test_video_ids.npy"),
+                                 allow_pickle=True)
+
+            # Verify matrix shape
+            n_test_q = q_y_test.shape[0]
+            if K_test_hw.shape[0] != n_test_q:
+                # Try raw features as fallback
+                X_test_raw = np.load(cfg.features_dir / "test_features.npy")
+                X_test_q   = reducer.transform(X_test_raw[:n_test_q])
+                q_y_test   = np.load(cfg.features_dir / "test_labels.npy")[:n_test_q]
+                q_vid_test = np.load(cfg.features_dir / "test_video_ids.npy",
+                                     allow_pickle=True)[:n_test_q]
+
+            import warnings, time as _time
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", category=FutureWarning)
+                t_inf_start = _time.time()
+                q_y_prob = qsvm.predict_proba(K_test_hw)[:, 1]
+                q_y_pred = qsvm.predict(K_test_hw)
+                q_infer  = _time.time() - t_inf_start
+
+            q_frame_metrics = evaluate_classifier(
+                model_name="quantum_svm",
+                model_obj=qsvm,
+                X_test_pca=K_test_hw,    # passed as precomputed kernel
+                y_test=q_y_test,
+                video_ids=q_vid_test,
+                pca_n_components=q_cfg.feature_dimension,
+                X_test_orig_dim=512,
+                results_base_dir=results_base_dir,
+                cfg=cfg,
+                threshold=args.threshold,
+            )
+
+            q_record = {
+                "model_name":       "quantum_svm",
+                "display_name":     f"Quantum Kernel SVM ({q_cfg.num_qubits}q)",
+                "train_time_sec":   round(k_compute_time, 2),
+                "infer_time_sec":   round(q_infer, 2),
+                "infer_latency_ms": round((q_infer / max(len(q_y_test), 1)) * 1000.0, 4),
+                "kernel_compute_time_sec": round(k_compute_time, 2),
+                "frame_accuracy":  q_frame_metrics["frame_level"]["accuracy"],
+                "frame_precision": q_frame_metrics["frame_level"]["precision"],
+                "frame_recall":    q_frame_metrics["frame_level"]["recall"],
+                "frame_f1_score":  q_frame_metrics["frame_level"]["f1_score"],
+                "frame_roc_auc":   q_frame_metrics["frame_level"]["roc_auc"],
+                "video_accuracy":  q_frame_metrics["video_level"]["accuracy"],
+                "video_precision": q_frame_metrics["video_level"]["precision"],
+                "video_recall":    q_frame_metrics["video_level"]["recall"],
+                "video_f1_score":  q_frame_metrics["video_level"]["f1_score"],
+                "video_roc_auc":   q_frame_metrics["video_level"]["roc_auc"],
+            }
+            benchmark_records.append(q_record)
+            logger.info("Quantum Kernel SVM added to benchmark records.")
+
+        except FileNotFoundError as exc:
+            print()
+            print(f"  ⚠️  --include-quantum: model not found — {exc}")
+            print("  Run 'python -m src.quantum.quantum_svm --train' first.")
+            print()
+        except Exception as exc:
+            print()
+            print(f"  ⚠️  --include-quantum failed: {exc}")
+            print()
+
     # 4. Generate comparison table & summary
     df_comp = pd.DataFrame(benchmark_records)
     comp_dir = ensure_dir(results_base_dir / "comparison")
@@ -264,6 +376,17 @@ def main():
     with open(json_path, "w") as f:
         json.dump(benchmark_records, f, indent=4)
     logger.info(f"Saved comparison JSON: {json_path}")
+
+    # Write focused classical-vs-quantum CSV when QSVM was included
+    if args.include_quantum and benchmark_records:
+        q_rows = [r for r in benchmark_records if r["model_name"] == "quantum_svm"]
+        c_rows = [r for r in benchmark_records if r["model_name"] == "svm"]
+        cv_rows = c_rows + q_rows if c_rows else q_rows
+        if cv_rows:
+            df_cvq = pd.DataFrame(cv_rows)
+            cvq_path = comp_dir / "classical_vs_quantum.csv"
+            df_cvq.to_csv(cvq_path, index=False)
+            logger.info(f"Saved classical_vs_quantum.csv: {cvq_path}")
 
     # Generate comparison plots
     generate_comparison_plots(df_comp, comp_dir)
@@ -280,6 +403,10 @@ def main():
     print(header)
     print("-" * 80)
     for r in benchmark_records:
+        kernel_note = (
+            f"  [kernel: {r.get('kernel_compute_time_sec', 0):.1f}s]"
+            if r.get("model_name") == "quantum_svm" else ""
+        )
         row = (
             f"{r['display_name']:<20} | "
             f"{r['frame_accuracy']*100:8.2f}% | "
@@ -287,7 +414,7 @@ def main():
             f"{(r['frame_roc_auc'] or 0.0):9.4f} | "
             f"{r['video_accuracy']*100:6.2f}% | "
             f"{r['video_f1_score']:6.4f} | "
-            f"{r['train_time_sec']:8.2f}s"
+            f"{r['train_time_sec']:8.2f}s{kernel_note}"
         )
         print(row)
     print("=" * 80)
